@@ -1,0 +1,2 @@
+config service "bee6d"
+   option "laniface" "lan"

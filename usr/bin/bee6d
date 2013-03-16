@@ -1,0 +1,112 @@
+#!/bin/sh
+
+PIDFILE=/var/run/bee6d.pid
+
+if [ ! "$1" == "-D" ]; then
+   if [ -e "$PIDFILE" ]; then
+      echo bee6d already running!
+      kill $(cat "$PIDFILE")
+      sleep 5
+      if [ -e "$PIDFILE" ]; then
+         kill -9 $(cat "$PIDFILE")
+         rm -f "$PIDFILE"
+      fi
+   fi
+   touch "$PIDFILE"
+
+   $0 -D "$@" < /dev/null > /dev/null 2>&1 & 
+   echo $! > "$PIDFILE"
+   exit 0
+else
+   shift
+fi
+
+STATEFILE=/tmp/bee6d.rdisc
+export STATEFILE
+
+. /etc/functions.sh
+. /lib/network/config.sh
+scan_interfaces
+config_load bee6d
+
+LANIFACE="$(config_get $(config_get bee6d laniface) ifname)"
+
+log() {
+   logger -t bee6d -p daemon.notice "$@"
+}
+
+get_mac() {
+   ip link ls dev $1 | sed -ne '/link/s/.*link[^ ]\+ \([^ ]\+\) .*/\1/p'
+}
+
+get_prefix() {
+   sed -ne '/Prefix/s/.*: \+\([^ ]\+\).*/\1/p' "$STATEFILE"
+}
+
+get_lifetime() {
+   sed -ne '/lifetime/s/.*: \+\([^ ]\+\).*/\1/p' "$STATEFILE"
+}
+
+get_addr() {
+   ipv6calc --in prefix+mac --action prefixmac2ipv6 --out ipv6addr $1 $2
+}
+
+addr_unset() {
+   log "Deleting $2 from $1"
+   ip -6 addr del dev $1 $2
+}
+
+addr_set() {
+   log "Adding $2 to $1"
+   ip -6 addr add dev $1 $2
+}
+
+addr_reset() {
+   for i in $(ip -6 addr ls dev $1 | sed -ne 's/.*inet6 \([^ ]\+\).*scope.*global.*/\1/p'); do
+      log "Deleting $i from $1"
+      ip -6 addr del $i dev $1
+   done
+}
+
+reload_radvd() {
+   log "Reloading radvd"
+   /etc/init.d/radvd reload
+}
+
+update_adv() {
+   OLDADDR=$(get_addr $(get_prefix) $(get_mac $2))
+   rdisc6 -1 $1 > "$STATEFILE"
+   if [ "$?" == 0 ]; then
+      grep "lifetime" /tmp/bee6d.rdisc | log
+      grep "Prefix" /tmp/bee6d.rdisc | log
+      sleep 1
+      ADDR=$(get_addr $(get_prefix) $(get_mac $2))
+      addr_unset $2 "$OLDADDR"
+      addr_reset $1
+      addr_set $2 "$ADDR"
+      reload_radvd
+   else
+      log "Failed to receive RA"
+   fi
+
+}
+
+shutdown_bee6d() {
+   log "Terminating by signal"
+   OLDADDR=$(get_addr $(get_prefix) $(get_mac "$LANIFACE"))
+   addr_unset "$LANIFACE" "$OLDADDR"
+   reload_radvd
+   rm -f "$PIDFILE"
+   kill -QUIT -$DPID
+   exit 0
+}
+
+export DPID=$$
+trap shutdown_bee6d TERM INT
+
+while :; do
+update_adv $1 "$LANIFACE"
+SLEEP=$(get_lifetime)
+log Sleeping for $SLEEP seconds
+sleep $SLEEP & wait $!
+done

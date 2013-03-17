@@ -1,3 +1,3 @@
 #!/bin/sh
 
-/usr/bin/bee6d $IFNAME
+[ -n "$LLLOCAL" ] && /usr/bin/bee6d -i $IFNAME

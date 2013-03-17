@@ -1,38 +1,109 @@
 #!/bin/sh
 
-PIDFILE=/var/run/bee6d.pid
+unset PIDFILE
 
-if [ ! "$1" == "-D" ]; then
-   if [ -e "$PIDFILE" ]; then
-      echo bee6d already running!
-      kill $(cat "$PIDFILE")
-      sleep 5
-      if [ -e "$PIDFILE" ]; then
-         kill -9 $(cat "$PIDFILE")
-         rm -f "$PIDFILE"
+fail_exit() {
+   [ -n "$PIDFILE" ] && rm -f "$PIDFILE"
+   exit 1
+}
+
+usage() {
+   echo "Beeline IPv6 hack usage"
+   echo "bee6d [-D] [-i <iface name>] [-p <iface profile name>]"
+   echo "    -D              - run in foreground"
+   echo "    -k              - kill running bee6d process"
+   echo "    -i iface name   - name of ppp interface (e.g. l2tp-vpn)"
+   echo "    -p profile name - name of ppp interface profile (e.g. wan)"
+   echo "    -i and -p are exclusive options."
+   echo "Please see /etc/config/bee6d for bee6d settings"
+   fail_exit
+}
+
+unset VPNIFACE VPNPROF FGRUN KILLIT
+
+while getopts "Dki:p:" opt; do
+   if [ "$opt" = "D" ]; then
+      FGRUN=1
+   fi
+   if [ "$opt" = "k" ]; then
+      KILLIT=1
+   fi
+   if [ "$opt" = "i" ] || [ "$opt" = "p" ]; then
+      if [ -n "$VPNIFACE" ] || [ -n "$VPNPROF" ]; then
+         echo You must specify only one of -i or -p options.
+         usage
+      fi
+      if [ "$opt" = "i" ]; then
+         VPNIFACE="$OPTARG"
+      else
+         VPNPROF="$OPTARG"
       fi
    fi
-   touch "$PIDFILE"
+done
 
-   $0 -D "$@" < /dev/null > /dev/null 2>&1 & 
-   echo $! > "$PIDFILE"
-   exit 0
-else
-   shift
+if [ -z "$VPNIFACE$VPNPROF" ]; then
+  echo Please specify one of -i or -p options.
+  usage
 fi
-
-STATEFILE=/tmp/bee6d.rdisc
-export STATEFILE
+shift $(($OPTIND - 1))
 
 . /etc/functions.sh
 . /lib/network/config.sh
 scan_interfaces
 config_load bee6d
 
-LANIFACE="$(config_get $(config_get bee6d laniface) ifname)"
+if [ -n "$VPNPROF" ]; then
+   VPNIFACE=$(config_get "$VPNPROF" ifname)
+   if [ -z "$VPNIFACE" ]; then
+      echo Cannot determine interface name. Please specify -i.
+      usage
+   fi
+else
+   VPNPROF=$(find_config "$VPNIFACE")
+   if [ -z "$VPNPROF" ]; then
+      echo Cannot determine interface profile. Please specify -p.
+      usage
+   fi
+fi
+
+if ! ip link show dev "$VPNIFACE" > /dev/null; then
+   usage
+fi
+
+PIDFILE="/var/run/bee6d.${VPNIFACE}.pid"
+STATEFILE="/tmp/bee6d.${VPNIFACE}.rdisc"
+export STATEFILE
+
+if [ -n "$KILLIT" ]; then
+   [ -e "$PIDFILE" ] && kill -TERM $(cat "$PIDFILE")
+   exit $?
+fi
+
+# critical section
+lock "$PIDFILE.lock"
+if [ -e "$PIDFILE" ]; then
+   lock -u "$PIDFILE.lock"
+   echo bee6d already running. Restarting...
+   kill $(cat "$PIDFILE")
+   sleep 5
+   if [ -e "$PIDFILE" ]; then
+      kill -9 $(cat "$PIDFILE")
+      rm -f "$PIDFILE"
+   fi
+fi
+touch "$PIDFILE"
+lock -u "$PIDFILE.lock"
+rm -f "$PIDFILE.lock"
+# end of critical section
+
+LANIFACE="$(config_get $(config_get "$VPNPROF" laniface) ifname)"
+if [ -z "$LANIFACE" ]; then
+   echo "Cannot find LAN interface. Please check /etc/config/bee6d"
+   fail_exit
+fi
 
 log() {
-   logger -t bee6d -p daemon.notice "$@"
+   logger -t "bee6d[$$]: $VPNIFACE" -p daemon.notice "$@"
 }
 
 get_mac() {
@@ -61,6 +132,11 @@ addr_set() {
    ip -6 addr add dev $1 $2
 }
 
+addr_replace() {
+   log "Updating $2 on $1"
+   ip -6 addr replace dev $1 $2
+}
+
 addr_reset() {
    for i in $(ip -6 addr ls dev $1 | sed -ne 's/.*inet6 \([^ ]\+\).*scope.*global.*/\1/p'); do
       log "Deleting $i from $1"
@@ -76,19 +152,29 @@ reload_radvd() {
 update_adv() {
    OLDADDR=$(get_addr $(get_prefix) $(get_mac $2))
    rdisc6 -1 $1 > "$STATEFILE"
-   if [ "$?" == 0 ]; then
-      grep "lifetime" /tmp/bee6d.rdisc | log
-      grep "Prefix" /tmp/bee6d.rdisc | log
+   if [ "$?" = 0 ]; then
+      grep "lifetime" "$STATEFILE" | log
+      grep "Prefix" "$STATEFILE" | log
       sleep 1
       ADDR=$(get_addr $(get_prefix) $(get_mac $2))
-      addr_unset $2 "$OLDADDR"
       addr_reset $1
-      addr_set $2 "$ADDR"
+      if [ "$OLDADDR" != "$ADDR" ]; then
+         addr_unset $2 "$OLDADDR"
+         addr_set $2 "$ADDR"
+      else
+         addr_replace $2 "$ADDR"
+      fi
       reload_radvd
    else
       log "Failed to receive RA"
    fi
 
+}
+
+killall_jobs() {
+   for i in $(jobs -p); do
+      kill -PIPE $i
+   done
 }
 
 shutdown_bee6d() {
@@ -97,16 +183,27 @@ shutdown_bee6d() {
    addr_unset "$LANIFACE" "$OLDADDR"
    reload_radvd
    rm -f "$PIDFILE"
-   kill -QUIT -$DPID
+   killall_jobs
    exit 0
 }
 
-export DPID=$$
-trap shutdown_bee6d TERM INT
+main_loop() {
+   DPID=$(sh -c 'echo $PPID')
+   echo $DPID > "$PIDFILE"
+   trap shutdown_bee6d TERM INT
 
-while :; do
-update_adv $1 "$LANIFACE"
-SLEEP=$(get_lifetime)
-log Sleeping for $SLEEP seconds
-sleep $SLEEP & wait $!
-done
+   log "bee6d started."
+   while :; do
+      update_adv "$VPNIFACE" "$LANIFACE"
+      SLEEP=$(get_lifetime)
+      log "Sleeping for $SLEEP seconds"
+      sleep $SLEEP & wait $!
+   done
+}
+
+if [ -n "$FGRUN" ]; then
+   main_loop
+else
+   main_loop &
+   exit 0
+fi

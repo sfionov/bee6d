@@ -1,2 +1,2 @@
-config service "bee6d"
+config interface "vpn"
    option "laniface" "lan"

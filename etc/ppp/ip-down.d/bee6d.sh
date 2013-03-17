@@ -1,4 +1,3 @@
 #!/bin/sh
 
-killall bee6d
-
+bee6d -k -i $IFNAME

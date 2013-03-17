@@ -3,7 +3,7 @@ bee6d ipv6 hack
 
 ####Prepare
 
-opkg install ipv6calc ip rdisc6
+    opkg install ipv6calc ip rdisc6
 
 /etc/config/network
 
